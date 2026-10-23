@@ -15,13 +15,19 @@ ACTIONS = {"create_draft","update_internal_record","send_approved_notice","reque
 DB_PATH = os.getenv("DATABASE_PATH", "./mailroom_agent.db")
 MAX_BODY = int(os.getenv("MAX_BODY_BYTES", str(8 * 1024 * 1024)))
 MAX_RESPONSE = 512 * 1024
-BATCH_SIZE = max(1, min(12, int(os.getenv("LLM_BATCH_SIZE", "10"))))
+BATCH_SIZE = max(1, min(12, int(os.getenv("LLM_BATCH_SIZE", "2"))))
 PROPOSAL_TIMEOUT = float(os.getenv("PROPOSAL_TIMEOUT_SECONDS", "48"))
+LLM_CONCURRENCY = max(1, min(3, int(os.getenv("LLM_CONCURRENCY", "1"))))
 app = FastAPI(title="Mailroom Action Gate", version="2.0.0")
 logger = logging.getLogger("mailroom")
+model_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
 
 class ProviderPayloadTooLarge(Exception):
     pass
+
+class ProviderRateLimited(Exception):
+    def __init__(self, retry_after: float | None):
+        self.retry_after = retry_after
 
 def canon(x: Any) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
@@ -188,8 +194,13 @@ async def model_chunk(ds, acts):
                     logger.error("llm_provider_auth_error status=%d", r.status_code)
                     raise RuntimeError(f"AI provider authentication failed (HTTP {r.status_code}); check LLM_API_KEY")
                 if r.status_code==429:
-                    logger.error("llm_provider_rate_limited status=429")
-                    raise RuntimeError("AI provider rate limit reached; retry later")
+                    retry_after = r.headers.get("Retry-After")
+                    try:
+                        retry_seconds = max(0.0, float(retry_after)) if retry_after is not None else None
+                    except ValueError:
+                        retry_seconds = None
+                    logger.warning("llm_provider_rate_limited status=429 retry_after_seconds=%s", retry_seconds)
+                    raise ProviderRateLimited(retry_seconds)
                 if r.status_code==413:
                     logger.error("llm_provider_payload_rejected status=413")
                     raise ProviderPayloadTooLarge()
@@ -221,19 +232,30 @@ async def model_chunk(ds, acts):
 
 async def generate(ds, acts):
     chunks=[ds[i:i+BATCH_SIZE] for i in range(0,len(ds),BATCH_SIZE)]
-    sem=asyncio.Semaphore(max(1,min(3,int(os.getenv("LLM_CONCURRENCY","2")))))
     async def run(ch):
-        try:
-            async with sem:
-                return await model_chunk(ch,acts)
-        except ProviderPayloadTooLarge:
-            if len(ch) == 1:
-                logger.error("llm_provider_single_dossier_rejected")
-                raise RuntimeError("AI provider rejected a single dossier; use a provider/model with a larger request limit") from None
-            midpoint=len(ch)//2
-            logger.warning("llm_batch_split rejected_dossiers=%d left=%d right=%d",len(ch),midpoint,len(ch)-midpoint)
-            left,right=await asyncio.gather(run(ch[:midpoint]),run(ch[midpoint:]))
-            return left+right
+        for attempt in range(3):
+            try:
+                async with model_semaphore:
+                    return await model_chunk(ch,acts)
+            except ProviderPayloadTooLarge:
+                if len(ch) == 1:
+                    logger.error("llm_provider_single_dossier_rejected")
+                    raise RuntimeError("AI provider rejected a single dossier; use a provider/model with a larger request limit") from None
+                midpoint=len(ch)//2
+                logger.warning("llm_batch_split rejected_dossiers=%d left=%d right=%d",len(ch),midpoint,len(ch)-midpoint)
+                left=await run(ch[:midpoint])
+                right=await run(ch[midpoint:])
+                return left+right
+            except ProviderRateLimited as e:
+                if attempt == 2:
+                    logger.error("llm_provider_rate_limit_retries_exhausted retries=%d",attempt)
+                    raise RuntimeError("AI provider rate limit persisted after retries; wait for the provider quota to reset") from None
+                delay=e.retry_after if e.retry_after is not None else float(2 ** attempt)
+                if delay > 6.0:
+                    logger.error("llm_provider_rate_limit_cooldown_exceeds_request_budget retry_after_seconds=%.1f",delay)
+                    raise RuntimeError(f"AI provider requested a {delay:.0f}-second cooldown; retry after the provider quota resets") from None
+                logger.warning("llm_provider_rate_limit_retry attempt=%d delay_seconds=%.1f",attempt+1,delay)
+                await asyncio.sleep(delay)
     result=await asyncio.gather(*(run(ch) for ch in chunks))
     out={}
     for rows in result:

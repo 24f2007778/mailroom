@@ -22,8 +22,8 @@ propose requests:
 | `LLM_BASE_URL` | Provider API base URL. | `https://api.groq.com/openai/v1` |
 | `LLM_MODEL` | Provider model identifier. | `openai/gpt-oss-120b` |
 | `DATABASE_PATH` | SQLite database path. Mount durable storage at this path in hosted deployments. | `./mailroom_agent.db` |
-| `LLM_BATCH_SIZE` | Maximum dossiers per model request (1–12). | `10` |
-| `LLM_CONCURRENCY` | Maximum concurrent model requests. | `2` |
+| `LLM_BATCH_SIZE` | Maximum dossiers per model request (1–12). | `2` |
+| `LLM_CONCURRENCY` | Maximum concurrent model requests (shared across requests in one app process). | `1` |
 | `LLM_TIMEOUT_SECONDS` | Timeout for each provider request. | `35` |
 | `PROPOSAL_TIMEOUT_SECONDS` | Overall limit for uncached proposal generation. | `48` |
 
@@ -32,6 +32,11 @@ automatically splits it into smaller batches and retries those. Render logs
 include `llm_batch_split` warnings when this happens. If one dossier by itself
 exceeds the provider's request limit, use a provider/model that accepts larger
 requests; the service logs `llm_provider_single_dossier_rejected`.
+Provider rate limits (HTTP 429) are retried up to two times using the
+`Retry-After` header when supplied, with short bounded waits. Reduce request
+volume or wait for the provider quota to reset if the service reports
+`llm_provider_rate_limit_retries_exhausted` or a cooldown longer than six
+seconds.
 
 The `LLM_API_KEY` must be supplied as a hosting secret; do not commit it or
 include it in the submitted endpoint URL. Keep the SQLite database on persistent
