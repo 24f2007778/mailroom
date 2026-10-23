@@ -27,6 +27,12 @@ propose requests:
 | `LLM_TIMEOUT_SECONDS` | Timeout for each provider request. | `35` |
 | `PROPOSAL_TIMEOUT_SECONDS` | Overall limit for uncached proposal generation. | `48` |
 
+If the provider rejects a batch as too large (HTTP 413), the service
+automatically splits it into smaller batches and retries those. Render logs
+include `llm_batch_split` warnings when this happens. If one dossier by itself
+exceeds the provider's request limit, use a provider/model that accepts larger
+requests; the service logs `llm_provider_single_dossier_rejected`.
+
 The `LLM_API_KEY` must be supplied as a hosting secret; do not commit it or
 include it in the submitted endpoint URL. Keep the SQLite database on persistent
 storage so evaluation, receipt, and decision-cache state survives restarts.

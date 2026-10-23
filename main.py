@@ -20,6 +20,9 @@ PROPOSAL_TIMEOUT = float(os.getenv("PROPOSAL_TIMEOUT_SECONDS", "48"))
 app = FastAPI(title="Mailroom Action Gate", version="2.0.0")
 logger = logging.getLogger("mailroom")
 
+class ProviderPayloadTooLarge(Exception):
+    pass
+
 def canon(x: Any) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 def digest(x: Any) -> str:
@@ -189,7 +192,7 @@ async def model_chunk(ds, acts):
                     raise RuntimeError("AI provider rate limit reached; retry later")
                 if r.status_code==413:
                     logger.error("llm_provider_payload_rejected status=413")
-                    raise RuntimeError("AI provider rejected batch size; lower LLM_BATCH_SIZE")
+                    raise ProviderPayloadTooLarge()
                 r.raise_for_status()
                 chunks=[]; size=0
                 async for chunk in r.aiter_bytes():
@@ -220,7 +223,17 @@ async def generate(ds, acts):
     chunks=[ds[i:i+BATCH_SIZE] for i in range(0,len(ds),BATCH_SIZE)]
     sem=asyncio.Semaphore(max(1,min(3,int(os.getenv("LLM_CONCURRENCY","2")))))
     async def run(ch):
-        async with sem: return await model_chunk(ch,acts)
+        try:
+            async with sem:
+                return await model_chunk(ch,acts)
+        except ProviderPayloadTooLarge:
+            if len(ch) == 1:
+                logger.error("llm_provider_single_dossier_rejected")
+                raise RuntimeError("AI provider rejected a single dossier; use a provider/model with a larger request limit") from None
+            midpoint=len(ch)//2
+            logger.warning("llm_batch_split rejected_dossiers=%d left=%d right=%d",len(ch),midpoint,len(ch)-midpoint)
+            left,right=await asyncio.gather(run(ch[:midpoint]),run(ch[midpoint:]))
+            return left+right
     result=await asyncio.gather(*(run(ch) for ch in chunks))
     out={}
     for rows in result:
