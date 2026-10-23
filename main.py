@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio, base64, hashlib, json, os, re, sqlite3, time
+from contextlib import contextmanager
+from datetime import datetime
 from typing import Any
 import httpx
 from fastapi import FastAPI, Request
@@ -12,20 +14,31 @@ ACTIONS = {"create_draft","update_internal_record","send_approved_notice","reque
 DB_PATH = os.getenv("DATABASE_PATH", "./mailroom_agent.db")
 MAX_BODY = int(os.getenv("MAX_BODY_BYTES", str(8 * 1024 * 1024)))
 MAX_RESPONSE = 512 * 1024
-BATCH_SIZE = max(1, min(12, int(os.getenv("LLM_BATCH_SIZE", "5"))))
+BATCH_SIZE = max(1, min(12, int(os.getenv("LLM_BATCH_SIZE", "10"))))
+PROPOSAL_TIMEOUT = float(os.getenv("PROPOSAL_TIMEOUT_SECONDS", "48"))
 app = FastAPI(title="Mailroom Action Gate", version="2.0.0")
 
 def canon(x: Any) -> str:
-    return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 def digest(x: Any) -> str:
     return hashlib.sha256(canon(x).encode("utf-8")).hexdigest()
 def b64u(s: str) -> bytes:
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    if not isinstance(s, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", s):
+        raise ValueError("invalid base64url value")
+    return base64.b64decode(s + "=" * (-len(s) % 4), altchars=b"-_", validate=True)
+
+@contextmanager
 def conn():
     c = sqlite3.connect(DB_PATH, timeout=20, isolation_level=None)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA busy_timeout=20000")
-    return c
+    try:
+        yield c
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 with conn() as c:
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("""CREATE TABLE IF NOT EXISTS evaluations(
@@ -58,9 +71,9 @@ def health():
     return {"name":"Mailroom Action Gate","status":"ok"}
 
 def validate_verifier(v):
-    if not isinstance(v,dict) or v.get("algorithm") != "Ed25519": raise ValueError("receiptVerifier must specify Ed25519")
+    if not isinstance(v,dict) or set(v) != {"algorithm", "publicKeyJwk"} or v.get("algorithm") != "Ed25519": raise ValueError("receiptVerifier must specify Ed25519")
     j=v.get("publicKeyJwk")
-    if not isinstance(j,dict) or j.get("kty")!="OKP" or j.get("crv")!="Ed25519" or not isinstance(j.get("x"),str):
+    if not isinstance(j,dict) or set(j) != {"kty", "crv", "x"} or j.get("kty")!="OKP" or j.get("crv")!="Ed25519" or not isinstance(j.get("x"),str):
         raise ValueError("invalid Ed25519 publicKeyJwk")
     raw=b64u(j["x"])
     if len(raw)!=32: raise ValueError("invalid Ed25519 public key")
@@ -71,41 +84,48 @@ def validate_dossiers(ds):
     if not isinstance(ds,list) or not ds or len(ds)>100: raise ValueError("dossiers must be a non-empty array of at most 100")
     seen=set()
     for d in ds:
-        if not isinstance(d,dict): raise ValueError("each dossier must be an object")
+        if not isinstance(d,dict) or set(d) != {"dossierId", "partition", "receivedAt", "mailbox", "objective", "sources"}: raise ValueError("each dossier must have the exact dossier fields")
         did=d.get("dossierId")
         if not isinstance(did,str) or not did or did in seen: raise ValueError("dossierId values must be non-empty and unique")
         seen.add(did)
         if d.get("partition") not in {"stable_core","fresh_audit"}: raise ValueError("invalid dossier partition")
         for k in ("receivedAt","mailbox","objective"):
-            if not isinstance(d.get(k),str): raise ValueError(f"{k} must be a string")
+            if not isinstance(d.get(k),str) or not d[k]: raise ValueError(f"{k} must be a non-empty string")
+        try:
+            received_at = datetime.fromisoformat(d["receivedAt"].replace("Z", "+00:00"))
+            if received_at.tzinfo is None: raise ValueError()
+        except ValueError:
+            raise ValueError("receivedAt must be an ISO timestamp with a timezone")
         if not isinstance(d.get("sources"),list): raise ValueError("sources must be an array")
         sources=set(); lines=set()
         for src in d["sources"]:
-            if not isinstance(src,dict): raise ValueError("source must be an object")
+            if not isinstance(src,dict) or set(src) != {"sourceId", "kind", "provenance", "title", "lines"}: raise ValueError("source must have the exact source fields")
             for k in ("sourceId","kind","provenance","title"):
-                if not isinstance(src.get(k),str): raise ValueError(f"source {k} must be a string")
+                if not isinstance(src.get(k),str) or not src[k]: raise ValueError(f"source {k} must be a non-empty string")
             if src["sourceId"] in sources: raise ValueError("duplicate sourceId")
             sources.add(src["sourceId"])
             if not isinstance(src.get("lines"),list): raise ValueError("source lines must be an array")
             for ln in src["lines"]:
-                if not isinstance(ln,dict) or not isinstance(ln.get("lineId"),str) or not isinstance(ln.get("text"),str):
-                    raise ValueError("each line requires lineId and text strings")
+                if not isinstance(ln,dict) or set(ln) != {"lineId", "text"} or not isinstance(ln.get("lineId"),str) or not isinstance(ln.get("text"),str):
+                    raise ValueError("each line must have lineId and text strings")
                 if not ln["lineId"] or ln["lineId"] in lines: raise ValueError("lineId values must be unique and non-empty")
                 lines.add(ln["lineId"])
     return ds
 
 def validate_propose(body):
-    if not isinstance(body,dict) or body.get("profile")!=PROFILE or body.get("operation")!="propose":
+    if not isinstance(body,dict) or set(body) != {"profile", "operation", "evaluationId", "receiptVerifier", "corpus", "allowedActions", "dossiers"} or body.get("profile")!=PROFILE or body.get("operation")!="propose":
         raise ValueError("profile or operation is invalid")
     if not isinstance(body.get("evaluationId"),str) or not body["evaluationId"]: raise ValueError("evaluationId is required")
     v=validate_verifier(body.get("receiptVerifier"))
     co=body.get("corpus")
-    if not isinstance(co,dict) or not isinstance(co.get("coreId"),str) or not isinstance(co.get("auditId"),str):
+    if not isinstance(co,dict) or set(co) != {"coreId", "auditId", "stableCount", "freshCount"} or not isinstance(co.get("coreId"),str) or not co["coreId"] or not isinstance(co.get("auditId"),str) or not co["auditId"]:
         raise ValueError("corpus coreId and auditId are required")
-    if not isinstance(co.get("stableCount"),int) or not isinstance(co.get("freshCount"),int): raise ValueError("corpus counts must be integers")
+    if type(co.get("stableCount")) is not int or type(co.get("freshCount")) is not int or co["stableCount"] < 0 or co["freshCount"] < 0: raise ValueError("corpus counts must be non-negative integers")
     acts=body.get("allowedActions")
-    if not isinstance(acts,list) or len(acts)!=6 or set(acts)!=ACTIONS: raise ValueError("allowedActions must contain exactly the six permitted actions")
+    if not isinstance(acts,list) or len(acts)!=6 or any(not isinstance(a,str) for a in acts) or set(acts)!=ACTIONS: raise ValueError("allowedActions must contain exactly the six permitted actions")
     ds=validate_dossiers(body.get("dossiers"))
+    if sum(d["partition"] == "stable_core" for d in ds) != co["stableCount"] or sum(d["partition"] == "fresh_audit" for d in ds) != co["freshCount"]:
+        raise ValueError("corpus counts do not match dossier partitions")
     return {"profile":PROFILE,"operation":"propose","evaluationId":body["evaluationId"],"receiptVerifier":v,"corpus":co,"allowedActions":acts,"dossiers":ds}
 
 def line_map(d):
@@ -155,11 +175,17 @@ async def model_chunk(ds, acts):
     model=os.getenv("LLM_MODEL","openai/gpt-oss-120b")
     payload={"model":model,"temperature":0,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":PROMPT},{"role":"user","content":canon({"allowedActions":acts,"dossiers":ds})}]}
     async with httpx.AsyncClient(timeout=httpx.Timeout(float(os.getenv("LLM_TIMEOUT_SECONDS","35")),connect=8)) as client:
-        r=await client.post(base+"/chat/completions",headers={"Authorization":"Bearer "+key,"Content-Type":"application/json"},json=payload)
-    if r.status_code==429: raise RuntimeError("AI provider rate limit reached; retry later")
-    if r.status_code==413: raise RuntimeError("AI provider rejected batch size; lower LLM_BATCH_SIZE")
-    r.raise_for_status()
-    rows=json.loads(r.json()["choices"][0]["message"]["content"]).get("proposals")
+        async with client.stream("POST",base+"/chat/completions",headers={"Authorization":"Bearer "+key,"Content-Type":"application/json"},json=payload) as r:
+            if r.status_code==429: raise RuntimeError("AI provider rate limit reached; retry later")
+            if r.status_code==413: raise RuntimeError("AI provider rejected batch size; lower LLM_BATCH_SIZE")
+            r.raise_for_status()
+            chunks=[]; size=0
+            async for chunk in r.aiter_bytes():
+                size+=len(chunk)
+                if size>MAX_RESPONSE: raise ValueError("AI provider response exceeded the size limit")
+                chunks.append(chunk)
+    rows=json.loads(b"".join(chunks)).get("choices",[])[0]["message"]["content"]
+    rows=json.loads(rows).get("proposals")
     if not isinstance(rows,list): raise ValueError("model response has no proposals array")
     return rows
 
@@ -198,7 +224,7 @@ async def propose(req):
             if row: cached[d["dossierId"]]=json.loads(row["proposal_json"])
             else: fresh.append(d)
     try:
-        raw=await generate(fresh,req["allowedActions"]) if fresh else {}
+        raw=await asyncio.wait_for(generate(fresh,req["allowedActions"]),timeout=PROPOSAL_TIMEOUT) if fresh else {}
         made={d["dossierId"]:validate_proposal(d,raw[d["dossierId"]]) for d in fresh}
     except Exception as e:
         return response({"error":"proposal generation failed","detail":str(e)[:200]},503)
@@ -233,7 +259,7 @@ def verify_sig(verifier,eid,inp,r):
     except (ValueError,KeyError,TypeError,InvalidSignature): return False
 
 async def commit(req):
-    if not isinstance(req,dict) or req.get("profile")!=PROFILE or req.get("operation")!="commit" or not isinstance(req.get("evaluationId"),str) or not req["evaluationId"]:
+    if not isinstance(req,dict) or set(req) != {"profile", "operation", "evaluationId", "inputDigest", "receipts"} or req.get("profile")!=PROFILE or req.get("operation")!="commit" or not isinstance(req.get("evaluationId"),str) or not req["evaluationId"]:
         return response({"error":"profile, operation, and evaluationId are required"},400)
     if not isinstance(req.get("inputDigest"),str) or not re.fullmatch(r"[0-9a-f]{64}",req["inputDigest"]) or not isinstance(req.get("receipts"),list) or not req["receipts"]:
         return response({"error":"inputDigest or receipts is invalid"},400)
@@ -247,18 +273,22 @@ async def commit(req):
         if req["inputDigest"]!=ev["input_digest"]: return response({"error":"inputDigest mismatch"},409)
         saved=json.loads(ev["propose_json"]); proposals=saved["proposals"]; verifier=json.loads(ev["verifier_json"])
     if len(req["receipts"])!=len(proposals): return response({"error":"receipt set must cover every proposal exactly once"},400)
-    byid={p["dossierId"]:p for p in proposals}; seen=set(); calls=set(); matched=[]
+    byid={p["dossierId"]:p for p in proposals}; seen=set(); calls=set(); receipt_ids=set(); matched=[]
     for r in req["receipts"]:
         if not isinstance(r,dict): return response({"error":"malformed receipt"},400)
         did=r.get("dossierId"); p=byid.get(did)
         if p is None or did in seen or r.get("callId") in calls: return response({"error":"duplicate or unknown receipt"},400)
         seen.add(did); calls.add(r.get("callId"))
+        receipt_id=r.get("receiptId")
+        if not isinstance(receipt_id,str) or not receipt_id or receipt_id in receipt_ids: return response({"error":"missing or duplicate receiptId"},400)
+        receipt_ids.add(receipt_id)
         if r.get("callId")!=p["callId"] or r.get("action")!=p["action"] or r.get("proposalDigest")!=p_digest(p):
             return response({"error":"receipt does not match persisted proposal"},409)
         if not verify_sig(verifier,eid,ev["input_digest"],r): return response({"error":"invalid receipt signature"},400)
         matched.append((r,p))
     if seen!=set(byid): return response({"error":"receipt set is incomplete"},400)
-    outcomes=[{"dossierId":p["dossierId"],"callId":p["callId"],"action":p["action"],"proposalDigest":r["proposalDigest"],"receiptId":r["receiptId"],"status":"executed" if r["accepted"] else "rejected"} for r,p in matched]
+    receipt_by_id={r["dossierId"]:r for r,p in matched}
+    outcomes=[{"dossierId":p["dossierId"],"callId":p["callId"],"action":p["action"],"proposalDigest":receipt_by_id[p["dossierId"]]["proposalDigest"],"receiptId":receipt_by_id[p["dossierId"]]["receiptId"],"status":"executed" if receipt_by_id[p["dossierId"]]["accepted"] else "rejected"} for p in proposals]
     body={"profile":PROFILE,"evaluationId":eid,"status":"completed","inputDigest":ev["input_digest"],"outcomes":outcomes}
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
@@ -270,13 +300,17 @@ async def commit(req):
         c.execute("UPDATE evaluations SET commit_hash=?,commit_json=?,receipts_json=? WHERE evaluation_id=? AND commit_json IS NULL",(rh,canon(body),canon(req["receipts"]),eid)); c.commit()
     return response(body)
 
+@app.post("/v1/mailroom/actions")
 @app.post("/")
 async def endpoint(request: Request):
     try:
-        raw=await request.body()
-        if len(raw)>MAX_BODY: return response({"error":"request body too large"},413)
-        body=json.loads(raw)
-    except (json.JSONDecodeError,UnicodeDecodeError): return response({"error":"valid JSON required"},400)
+        chunks=[]; size=0
+        async for chunk in request.stream():
+            size+=len(chunk)
+            if size>MAX_BODY: return response({"error":"request body too large"},413)
+            chunks.append(chunk)
+        body=json.loads(b"".join(chunks),parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"invalid JSON constant: {value}")))
+    except (json.JSONDecodeError,UnicodeDecodeError,ValueError): return response({"error":"valid JSON required"},400)
     if not isinstance(body,dict): return response({"error":"JSON object required"},400)
     if body.get("operation")=="propose": return await propose(body)
     if body.get("operation")=="commit": return await commit(body)
