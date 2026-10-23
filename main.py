@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, base64, hashlib, json, os, re, sqlite3, time
+import logging
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
@@ -17,6 +18,7 @@ MAX_RESPONSE = 512 * 1024
 BATCH_SIZE = max(1, min(12, int(os.getenv("LLM_BATCH_SIZE", "10"))))
 PROPOSAL_TIMEOUT = float(os.getenv("PROPOSAL_TIMEOUT_SECONDS", "48"))
 app = FastAPI(title="Mailroom Action Gate", version="2.0.0")
+logger = logging.getLogger("mailroom")
 
 def canon(x: Any) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
@@ -170,22 +172,47 @@ Cite the smallest sufficient set of exact lineId values proving authority and ar
 
 async def model_chunk(ds, acts):
     key=os.getenv("LLM_API_KEY","")
-    if not key: raise RuntimeError("LLM_API_KEY is not configured")
+    if not key:
+        logger.error("llm_configuration_error missing=LLM_API_KEY")
+        raise RuntimeError("LLM_API_KEY is not configured")
     base=os.getenv("LLM_BASE_URL","https://api.groq.com/openai/v1").rstrip("/")
     model=os.getenv("LLM_MODEL","openai/gpt-oss-120b")
     payload={"model":model,"temperature":0,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":PROMPT},{"role":"user","content":canon({"allowedActions":acts,"dossiers":ds})}]}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(float(os.getenv("LLM_TIMEOUT_SECONDS","35")),connect=8)) as client:
-        async with client.stream("POST",base+"/chat/completions",headers={"Authorization":"Bearer "+key,"Content-Type":"application/json"},json=payload) as r:
-            if r.status_code==429: raise RuntimeError("AI provider rate limit reached; retry later")
-            if r.status_code==413: raise RuntimeError("AI provider rejected batch size; lower LLM_BATCH_SIZE")
-            r.raise_for_status()
-            chunks=[]; size=0
-            async for chunk in r.aiter_bytes():
-                size+=len(chunk)
-                if size>MAX_RESPONSE: raise ValueError("AI provider response exceeded the size limit")
-                chunks.append(chunk)
-    rows=json.loads(b"".join(chunks)).get("choices",[])[0]["message"]["content"]
-    rows=json.loads(rows).get("proposals")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(float(os.getenv("LLM_TIMEOUT_SECONDS","35")),connect=8)) as client:
+            async with client.stream("POST",base+"/chat/completions",headers={"Authorization":"Bearer "+key,"Content-Type":"application/json"},json=payload) as r:
+                if r.status_code in {401,403}:
+                    logger.error("llm_provider_auth_error status=%d", r.status_code)
+                    raise RuntimeError(f"AI provider authentication failed (HTTP {r.status_code}); check LLM_API_KEY")
+                if r.status_code==429:
+                    logger.error("llm_provider_rate_limited status=429")
+                    raise RuntimeError("AI provider rate limit reached; retry later")
+                if r.status_code==413:
+                    logger.error("llm_provider_payload_rejected status=413")
+                    raise RuntimeError("AI provider rejected batch size; lower LLM_BATCH_SIZE")
+                r.raise_for_status()
+                chunks=[]; size=0
+                async for chunk in r.aiter_bytes():
+                    size+=len(chunk)
+                    if size>MAX_RESPONSE:
+                        logger.error("llm_provider_response_too_large limit_bytes=%d", MAX_RESPONSE)
+                        raise ValueError("AI provider response exceeded the size limit")
+                    chunks.append(chunk)
+    except httpx.HTTPStatusError as e:
+        logger.error("llm_provider_http_error status=%d", e.response.status_code)
+        raise RuntimeError(f"AI provider returned HTTP {e.response.status_code}") from None
+    except httpx.TimeoutException as e:
+        logger.error("llm_provider_timeout error_type=%s", type(e).__name__)
+        raise RuntimeError("AI provider request timed out") from None
+    except httpx.RequestError as e:
+        logger.error("llm_provider_connection_error error_type=%s", type(e).__name__)
+        raise RuntimeError("Could not connect to AI provider") from None
+    try:
+        rows=json.loads(b"".join(chunks)).get("choices",[])[0]["message"]["content"]
+        rows=json.loads(rows).get("proposals")
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError, AttributeError):
+        logger.error("llm_provider_malformed_response")
+        raise RuntimeError("AI provider returned a malformed response") from None
     if not isinstance(rows,list): raise ValueError("model response has no proposals array")
     return rows
 
@@ -227,6 +254,7 @@ async def propose(req):
         raw=await asyncio.wait_for(generate(fresh,req["allowedActions"]),timeout=PROPOSAL_TIMEOUT) if fresh else {}
         made={d["dossierId"]:validate_proposal(d,raw[d["dossierId"]]) for d in fresh}
     except Exception as e:
+        logger.error("proposal_generation_failed error_type=%s", type(e).__name__)
         return response({"error":"proposal generation failed","detail":str(e)[:200]},503)
     allp={**cached,**made}
     body={"profile":PROFILE,"evaluationId":eid,"status":"awaiting_receipts","inputDigest":inp,"proposals":[allp[d["dossierId"]] for d in req["dossiers"]]}

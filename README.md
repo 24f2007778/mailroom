@@ -1,7 +1,8 @@
 # Mailroom Action Gate
 
 FastAPI service implementing the `ga5-mailroom-action-gate/v2` propose/commit API.
-Both operations are sent as JSON `POST /` requests.
+Both operations are sent as JSON `POST /v1/mailroom/actions` requests. `POST /`
+is also available as an alias.
 
 ## Run
 
@@ -29,8 +30,15 @@ propose requests:
 The `LLM_API_KEY` must be supplied as a hosting secret; do not commit it or
 include it in the submitted endpoint URL. Keep the SQLite database on persistent
 storage so evaluation, receipt, and decision-cache state survives restarts.
-Terminate HTTPS at the hosting provider's managed TLS proxy and expose the
-service's root URL without query parameters or fragments.
+Terminate HTTPS at the hosting provider's managed TLS proxy and submit the
+service URL with `/v1/mailroom/actions`, without credentials, query parameters,
+or fragments.
 
-`GET /` is a health check. The POST endpoint returns `503` for proposal
-generation failures, including when `LLM_API_KEY` is unset.
+`GET /` is a health check. When proposal generation fails, inspect the hosting
+provider's application logs (Render: service → Logs) at the time of the Check.
+The service logs safe diagnostic categories such as `llm_provider_auth_error`,
+`llm_provider_http_error`, `llm_provider_timeout`, and
+`proposal_generation_failed`; it does not log API keys or dossier contents.
+The POST response also includes a short `detail` value that can be inspected
+in the caller's Network response. A `503` can indicate model configuration,
+provider, timeout, or output-validation problems.
