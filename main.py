@@ -289,7 +289,8 @@ async def propose(req):
         raw=await asyncio.wait_for(generate(fresh,req["allowedActions"]),timeout=PROPOSAL_TIMEOUT) if fresh else {}
         made={d["dossierId"]:validate_proposal(d,raw[d["dossierId"]]) for d in fresh}
     except Exception as e:
-        logger.error("proposal_generation_failed error_type=%s", type(e).__name__)
+        detail=str(e)[:200] if isinstance(e,(ValueError,RuntimeError)) else "unexpected internal error"
+        logger.error("proposal_generation_failed error_type=%s detail=%s", type(e).__name__, detail)
         return response({"error":"proposal generation failed","detail":str(e)[:200]},503)
     allp={**cached,**made}
     body={"profile":PROFILE,"evaluationId":eid,"status":"awaiting_receipts","inputDigest":inp,"proposals":[allp[d["dossierId"]] for d in req["dossiers"]]}
