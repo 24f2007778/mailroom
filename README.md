@@ -37,6 +37,9 @@ Provider rate limits (HTTP 429) are retried up to two times using the
 volume or wait for the provider quota to reset if the service reports
 `llm_provider_rate_limit_retries_exhausted` or a cooldown longer than six
 seconds.
+Transient provider server errors (HTTP 500, 502, 503, or 504) are retried up to
+two times with short bounded waits. If they persist, check the provider's
+availability and the configured model/base URL; the service returns HTTP 503.
 
 The `LLM_API_KEY` must be supplied as a hosting secret; do not commit it or
 include it in the submitted endpoint URL. Keep the SQLite database on persistent

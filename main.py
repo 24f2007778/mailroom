@@ -29,6 +29,11 @@ class ProviderRateLimited(Exception):
     def __init__(self, retry_after: float | None):
         self.retry_after = retry_after
 
+class ProviderUnavailable(Exception):
+    def __init__(self, status_code: int, retry_after: float | None):
+        self.status_code = status_code
+        self.retry_after = retry_after
+
 def canon(x: Any) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 def digest(x: Any) -> str:
@@ -257,6 +262,14 @@ async def model_chunk(ds, acts, validation_feedback=None):
                 if r.status_code==413:
                     logger.error("llm_provider_payload_rejected status=413")
                     raise ProviderPayloadTooLarge()
+                if r.status_code in {500,502,503,504}:
+                    retry_after = r.headers.get("Retry-After")
+                    try:
+                        retry_seconds = max(0.0, float(retry_after)) if retry_after is not None else None
+                    except ValueError:
+                        retry_seconds = None
+                    logger.warning("llm_provider_unavailable status=%d retry_after_seconds=%s",r.status_code,retry_seconds)
+                    raise ProviderUnavailable(r.status_code,retry_seconds)
                 r.raise_for_status()
                 chunks=[]; size=0
                 async for chunk in r.aiter_bytes():
@@ -310,6 +323,16 @@ async def generate(ds, acts):
                     logger.error("llm_provider_rate_limit_cooldown_exceeds_request_budget retry_after_seconds=%.1f",delay)
                     raise RuntimeError(f"AI provider requested a {delay:.0f}-second cooldown; retry after the provider quota resets") from None
                 logger.warning("llm_provider_rate_limit_retry attempt=%d delay_seconds=%.1f",attempt+1,delay)
+                await asyncio.sleep(delay)
+            except ProviderUnavailable as e:
+                if attempt == 2:
+                    logger.error("llm_provider_unavailable_retries_exhausted status=%d retries=%d",e.status_code,attempt)
+                    raise RuntimeError(f"AI provider remained unavailable (HTTP {e.status_code}) after retries") from None
+                delay=e.retry_after if e.retry_after is not None else float(2 ** attempt)
+                if delay > 6.0:
+                    logger.error("llm_provider_unavailable_cooldown_exceeds_request_budget status=%d retry_after_seconds=%.1f",e.status_code,delay)
+                    raise RuntimeError(f"AI provider requested a {delay:.0f}-second cooldown; retry after the provider recovers") from None
+                logger.warning("llm_provider_unavailable_retry status=%d attempt=%d delay_seconds=%.1f",e.status_code,attempt+1,delay)
                 await asyncio.sleep(delay)
     result=await asyncio.gather(*(run(ch) for ch in chunks))
     out={}
