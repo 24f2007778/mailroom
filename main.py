@@ -38,6 +38,9 @@ class ProviderUnavailable(Exception):
 class ProviderMalformedResponse(Exception):
     pass
 
+class ProviderSchemaUnsupported(Exception):
+    pass
+
 def canon(x: Any) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 def digest(x: Any) -> str:
@@ -301,7 +304,7 @@ def parse_provider_response(body):
         raise ProviderMalformedResponse("provider completion JSON did not contain a proposals array")
     return result["proposals"]
 
-async def model_chunk(ds, acts, validation_feedback=None):
+async def model_chunk(ds, acts, validation_feedback=None, repair_action=None, structured_repair=True):
     key=os.getenv("LLM_API_KEY","")
     if not key:
         logger.error("llm_configuration_error missing=LLM_API_KEY")
@@ -309,9 +312,20 @@ async def model_chunk(ds, acts, validation_feedback=None):
     base=os.getenv("LLM_BASE_URL","https://api.groq.com/openai/v1").rstrip("/")
     model=os.getenv("LLM_MODEL","openai/gpt-oss-120b")
     user_content={"allowedActions":acts,"dossiers":ds}
+    messages=[{"role":"system","content":PROMPT}]
     if validation_feedback:
-        user_content["validationFeedback"]=validation_feedback
-    payload={"model":model,"temperature":0,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":PROMPT},{"role":"user","content":canon(user_content)}]}
+        messages.append({"role":"system","content":validation_feedback})
+    response_format={"type":"json_object"}
+    if repair_action and structured_repair:
+        response_format={
+            "type":"json_schema",
+            "json_schema":{
+                "name":"mailroom_proposal_repair",
+                "strict":True,
+                "schema":repair_response_schema(repair_action),
+            },
+        }
+    payload={"model":model,"temperature":0,"response_format":response_format,"messages":messages+[{"role":"user","content":canon(user_content)}]}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(float(os.getenv("LLM_TIMEOUT_SECONDS","35")),connect=8)) as client:
             async with client.stream("POST",base+"/chat/completions",headers={"Authorization":"Bearer "+key,"Content-Type":"application/json"},json=payload) as r:
@@ -329,6 +343,9 @@ async def model_chunk(ds, acts, validation_feedback=None):
                 if r.status_code==413:
                     logger.error("llm_provider_payload_rejected status=413")
                     raise ProviderPayloadTooLarge()
+                if repair_action and structured_repair and r.status_code in {400,422}:
+                    logger.warning("llm_provider_json_schema_unsupported status=%d",r.status_code)
+                    raise ProviderSchemaUnsupported()
                 if r.status_code in {500,502,503,504}:
                     retry_after = r.headers.get("Retry-After")
                     try:
@@ -359,22 +376,32 @@ async def model_chunk(ds, acts, validation_feedback=None):
 
 async def generate(ds, acts):
     chunks=[ds[i:i+BATCH_SIZE] for i in range(0,len(ds),BATCH_SIZE)]
-    async def run(ch, validation_feedback=None):
+    async def run(ch, validation_feedback=None, repair_action=None):
+        structured_repair=True
         for attempt in range(3):
             try:
                 async with model_semaphore:
-                    if validation_feedback is None:
-                        return await model_chunk(ch,acts)
-                    return await model_chunk(ch,acts,validation_feedback)
+                    return await model_chunk(
+                        ch,
+                        acts,
+                        validation_feedback,
+                        repair_action,
+                        structured_repair,
+                    )
             except ProviderPayloadTooLarge:
                 if len(ch) == 1:
                     logger.error("llm_provider_single_dossier_rejected")
                     raise RuntimeError("AI provider rejected a single dossier; use a provider/model with a larger request limit") from None
                 midpoint=len(ch)//2
                 logger.warning("llm_batch_split rejected_dossiers=%d left=%d right=%d",len(ch),midpoint,len(ch)-midpoint)
-                left=await run(ch[:midpoint],validation_feedback)
-                right=await run(ch[midpoint:],validation_feedback)
+                left=await run(ch[:midpoint],validation_feedback,repair_action)
+                right=await run(ch[midpoint:],validation_feedback,repair_action)
                 return left+right
+            except ProviderSchemaUnsupported:
+                if not structured_repair:
+                    raise
+                structured_repair=False
+                logger.warning("llm_provider_json_schema_fallback format=json_object")
             except ProviderRateLimited as e:
                 if attempt == 2:
                     logger.error("llm_provider_rate_limit_retries_exhausted retries=%d",attempt)
@@ -432,7 +459,8 @@ async def generate(ds, acts):
                     +repair_guidance(raw.get("action") if isinstance(raw,dict) else None)
                     +" Validator error: "+reason
                 )
-                repaired=await run([dossiers_by_id[dossier_id]],feedback)
+                action=raw.get("action") if isinstance(raw,dict) else None
+                repaired=await run([dossiers_by_id[dossier_id]],feedback,action)
                 if len(repaired)!=1 or not isinstance(repaired[0],dict):
                     reason="model did not return one corrected proposal"
                     continue
@@ -494,6 +522,91 @@ def repair_guidance(action):
         f" For action {action}, use exactly this schema: {schema}. "
         "Angle-bracket values are descriptions, not literal strings."
     )
+
+def repair_response_schema(action):
+    string_schema={"type":"string"}
+    target_schemas={
+        "create_draft":{
+            "type":"object","additionalProperties":False,
+            "properties":{"kind":{"type":"string","enum":["draft_queue"]},"id":string_schema},
+            "required":["kind","id"],
+        },
+        "update_internal_record":{
+            "type":"object","additionalProperties":False,
+            "properties":{"kind":{"type":"string","enum":["case_record"]},"id":string_schema},
+            "required":["kind","id"],
+        },
+        "send_approved_notice":{
+            "type":"object","additionalProperties":False,
+            "properties":{"kind":{"type":"string","enum":["email"]},"id":string_schema},
+            "required":["kind","id"],
+        },
+        "request_confirmation":{
+            "type":"object","additionalProperties":False,
+            "properties":{"kind":{"type":"string","enum":["approval_queue"]},"id":string_schema},
+            "required":["kind","id"],
+        },
+        "quarantine_item":{
+            "type":"object","additionalProperties":False,
+            "properties":{"kind":{"type":"string","enum":["security_queue"]},"id":{"type":"string","enum":["mailroom"]}},
+            "required":["kind","id"],
+        },
+        "no_action":{"type":"null"},
+    }
+    payload_fields={
+        "create_draft":{
+            "recipient":string_schema,"referenceId":string_schema,"status":string_schema,
+            "template":{"type":"string","enum":["order_status"]},
+        },
+        "update_internal_record":{
+            "field":{"type":"string","enum":["delivery_window"]},
+            "sourceEventId":string_schema,"value":string_schema,
+        },
+        "send_approved_notice":{
+            "referenceId":string_schema,"status":string_schema,
+            "template":{"type":"string","enum":["approved_delivery_notice"]},
+        },
+        "request_confirmation":{
+            "claimedSender":string_schema,
+            "questionCode":{"type":"string","enum":["VERIFY_REQUEST"]},
+            "referenceId":string_schema,
+        },
+        "quarantine_item":{
+            "artifactId":string_schema,
+            "reasonCode":{"type":"string","enum":["INDIRECT_PROMPT_INJECTION"]},
+        },
+        "no_action":{
+            "reasonCode":{"type":"string","enum":["ALREADY_COMPLETED","DUPLICATE","INFORMATIONAL"]},
+            "referenceId":string_schema,
+        },
+    }
+    if action not in target_schemas:
+        raise ValueError("cannot build a repair schema for an unknown action")
+    payload_properties=payload_fields[action]
+    proposal_schema={
+        "type":"object","additionalProperties":False,
+        "properties":{
+            "dossierId":string_schema,
+            "action":{"type":"string","enum":[action]},
+            "target":target_schemas[action],
+            "payload":{
+                "type":"object","additionalProperties":False,
+                "properties":payload_properties,
+                "required":list(payload_properties),
+            },
+            "evidence":{"type":"array","items":string_schema},
+        },
+        "required":["dossierId","action","target","payload","evidence"],
+    }
+    return {
+        "type":"object","additionalProperties":False,
+        "properties":{
+            "proposals":{
+                "type":"array","items":proposal_schema,
+            },
+        },
+        "required":["proposals"],
+    }
 
 async def propose(req):
     try: req=validate_propose(req)

@@ -63,4 +63,8 @@ The POST response also includes a short `detail` value that can be inspected
 in the caller's Network response. A `503` can indicate model configuration,
 provider, timeout, or output-validation problems. If a generated proposal does
 not match its action schema, the service asks the model for up to two corrected
-proposals; it returns `503` if the corrections still fail validation.
+proposals. Corrections use strict action-specific JSON Schema output when
+supported by the provider/model, constraining payload fields during generation.
+If JSON Schema mode is rejected, the service falls back to JSON-object mode
+while retaining the specific correction instructions and local validation. It
+returns `503` if the corrections still fail validation.
