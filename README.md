@@ -40,6 +40,12 @@ seconds.
 Transient provider server errors (HTTP 500, 502, 503, or 504) are retried up to
 two times with short bounded waits. If they persist, check the provider's
 availability and the configured model/base URL; the service returns HTTP 503.
+These HTTP errors originate at the configured model provider and cannot be
+resolved by proposal parsing changes. A successful HTTP response with an
+unusable completion is logged as `llm_provider_malformed_response` with a safe
+reason category and retried up to two times. If those retries are exhausted,
+check provider compatibility with the configured chat-completions endpoint and
+JSON response format; response contents are not written to logs.
 
 The `LLM_API_KEY` must be supplied as a hosting secret; do not commit it or
 include it in the submitted endpoint URL. Keep the SQLite database on persistent

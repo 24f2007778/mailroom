@@ -35,6 +35,9 @@ class ProviderUnavailable(Exception):
         self.status_code = status_code
         self.retry_after = retry_after
 
+class ProviderMalformedResponse(Exception):
+    pass
+
 def canon(x: Any) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 def digest(x: Any) -> str:
@@ -254,6 +257,50 @@ no_action: target MUST be null; payload EXACTLY {"reasonCode":"ALREADY_COMPLETED
 
 Angle-bracket values describe the required fact; they are not literal output. Do not perform actions; propose only."""
 
+def parse_provider_response(body):
+    try:
+        envelope=json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.error("llm_provider_malformed_response reason=invalid_envelope_json")
+        raise ProviderMalformedResponse("provider response was not valid JSON") from None
+    if not isinstance(envelope,dict):
+        logger.error("llm_provider_malformed_response reason=invalid_envelope_shape")
+        raise ProviderMalformedResponse("provider response envelope was not an object")
+    choices=envelope.get("choices")
+    if not isinstance(choices,list) or not choices or not isinstance(choices[0],dict):
+        logger.error("llm_provider_malformed_response reason=missing_choices")
+        raise ProviderMalformedResponse("provider response did not contain a completion choice")
+    choice=choices[0]
+    message=choice.get("message")
+    if not isinstance(message,dict):
+        logger.error("llm_provider_malformed_response reason=missing_message")
+        raise ProviderMalformedResponse("provider completion did not contain a message")
+    content=message.get("content")
+    if isinstance(content,list):
+        text_parts=[]
+        for block in content:
+            if isinstance(block,str):
+                text_parts.append(block)
+            elif isinstance(block,dict) and block.get("type")=="text" and isinstance(block.get("text"),str):
+                text_parts.append(block["text"])
+            else:
+                logger.error("llm_provider_malformed_response reason=unsupported_content_block")
+                raise ProviderMalformedResponse("provider message contained an unsupported content block")
+        content="".join(text_parts)
+    if not isinstance(content,str) or not content.strip():
+        reason="refusal" if message.get("refusal") else "empty_content"
+        logger.error("llm_provider_malformed_response reason=%s",reason)
+        raise ProviderMalformedResponse("provider completion did not contain proposal JSON")
+    try:
+        result=json.loads(content)
+    except json.JSONDecodeError:
+        logger.error("llm_provider_malformed_response reason=invalid_content_json finish_reason=%s",choice.get("finish_reason","unknown"))
+        raise ProviderMalformedResponse("provider completion content was not valid JSON") from None
+    if not isinstance(result,dict) or not isinstance(result.get("proposals"),list):
+        logger.error("llm_provider_malformed_response reason=missing_proposals")
+        raise ProviderMalformedResponse("provider completion JSON did not contain a proposals array")
+    return result["proposals"]
+
 async def model_chunk(ds, acts, validation_feedback=None):
     key=os.getenv("LLM_API_KEY","")
     if not key:
@@ -307,13 +354,7 @@ async def model_chunk(ds, acts, validation_feedback=None):
     except httpx.RequestError as e:
         logger.error("llm_provider_connection_error error_type=%s", type(e).__name__)
         raise RuntimeError("Could not connect to AI provider") from None
-    try:
-        rows=json.loads(b"".join(chunks)).get("choices",[])[0]["message"]["content"]
-        rows=json.loads(rows).get("proposals")
-    except (json.JSONDecodeError, IndexError, KeyError, TypeError, AttributeError):
-        logger.error("llm_provider_malformed_response")
-        raise RuntimeError("AI provider returned a malformed response") from None
-    if not isinstance(rows,list): raise ValueError("model response has no proposals array")
+    rows=parse_provider_response(b"".join(chunks))
     return rows
 
 async def generate(ds, acts):
@@ -353,6 +394,13 @@ async def generate(ds, acts):
                     logger.error("llm_provider_unavailable_cooldown_exceeds_request_budget status=%d retry_after_seconds=%.1f",e.status_code,delay)
                     raise RuntimeError(f"AI provider requested a {delay:.0f}-second cooldown; retry after the provider recovers") from None
                 logger.warning("llm_provider_unavailable_retry status=%d attempt=%d delay_seconds=%.1f",e.status_code,attempt+1,delay)
+                await asyncio.sleep(delay)
+            except ProviderMalformedResponse as e:
+                if attempt == 2:
+                    logger.error("llm_provider_malformed_retries_exhausted retries=%d",attempt)
+                    raise RuntimeError(str(e)) from None
+                delay=0.5 * (attempt + 1)
+                logger.warning("llm_provider_malformed_retry attempt=%d delay_seconds=%.1f",attempt+1,delay)
                 await asyncio.sleep(delay)
     result=await asyncio.gather(*(run(ch) for ch in chunks))
     out={}
