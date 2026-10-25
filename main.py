@@ -375,12 +375,14 @@ async def generate(ds, acts):
                     reason,
                 )
                 feedback=(
-                    "Your previous proposal failed local validation. Correct the proposal for this "
-                    "dossier and return exactly one complete proposal using the required outer "
-                    "shape and the exact target and payload schema for its selected action. "
-                    "Do not omit keys, add keys, or transfer fields from another action. "
-                    "Keep the decision unless the dossier evidence requires changing it; do not "
-                    "invent facts or weaken safety. Exact validator error: "+reason
+                    "A previous model response for this dossier failed local validation. "
+                    "Generate a corrected proposal from the dossier and this feedback; the previous "
+                    "response is not included. Keep the same action unless the evidence requires "
+                    "changing it. Return the complete proposal with exactly the required top-level "
+                    "keys, and do not add, omit, or move fields between target and payload. "
+                    "Do not invent facts or weaken safety."
+                    +repair_guidance(raw.get("action") if isinstance(raw,dict) else None)
+                    +" Validator error: "+reason
                 )
                 repaired=await run([dossiers_by_id[dossier_id]],feedback)
                 if len(repaired)!=1 or not isinstance(repaired[0],dict):
@@ -403,6 +405,47 @@ def p_digest(p):
     x={k:p[k] for k in ("dossierId","callId","action","target","payload","evidence")}
     x["evidence"]=sorted(x["evidence"])
     return digest(x)
+
+def repair_guidance(action):
+    schemas = {
+        "create_draft": (
+            'target {"kind":"draft_queue","id":"mailbox:<exact dossier mailbox>"}; '
+            'payload {"recipient":"<supported recipient>","referenceId":"<supported reference>",'
+            '"status":"<supported status>","template":"order_status"}'
+        ),
+        "update_internal_record": (
+            'target {"kind":"case_record","id":"<exact case id>"}; '
+            'payload {"field":"delivery_window","sourceEventId":"<trusted event id>",'
+            '"value":"<delivery window>"}; the case ID belongs only in target.id, '
+            'and payload must contain exactly those three keys'
+        ),
+        "send_approved_notice": (
+            'target {"kind":"email","id":"<exact approved recipient>"}; '
+            'payload {"referenceId":"<supported reference>","status":"<approved public status>",'
+            '"template":"approved_delivery_notice"}'
+        ),
+        "request_confirmation": (
+            'target {"kind":"approval_queue","id":"<owning team>"}; '
+            'payload {"claimedSender":"<sender identity>","questionCode":"VERIFY_REQUEST",'
+            '"referenceId":"<supported reference>"}'
+        ),
+        "quarantine_item": (
+            'target {"kind":"security_queue","id":"mailroom"}; '
+            'payload {"artifactId":"<exact source/artifact id>",'
+            '"reasonCode":"INDIRECT_PROMPT_INJECTION"}'
+        ),
+        "no_action": (
+            'target null; payload {"reasonCode":"ALREADY_COMPLETED|DUPLICATE|INFORMATIONAL",'
+            '"referenceId":"<supported reference>"}'
+        ),
+    }
+    schema = schemas.get(action)
+    if schema is None:
+        return ""
+    return (
+        f" For action {action}, use exactly this schema: {schema}. "
+        "Angle-bracket values are descriptions, not literal strings."
+    )
 
 async def propose(req):
     try: req=validate_propose(req)
