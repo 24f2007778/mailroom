@@ -55,4 +55,6 @@ The service logs safe diagnostic categories such as `llm_provider_auth_error`,
 `proposal_generation_failed`; it does not log API keys or dossier contents.
 The POST response also includes a short `detail` value that can be inspected
 in the caller's Network response. A `503` can indicate model configuration,
-provider, timeout, or output-validation problems.
+provider, timeout, or output-validation problems. If a generated proposal does
+not match its action schema, the service asks the model for up to two corrected
+proposals; it returns `503` if the corrections still fail validation.
