@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
+from incidents import router as incident_router
 
 PROFILE = "ga5-mailroom-action-gate/v2"
 ACTIONS = {"create_draft","update_internal_record","send_approved_notice","request_confirmation","quarantine_item","no_action"}
@@ -494,3 +495,5 @@ async def endpoint(request: Request):
     if body.get("operation")=="propose": return await propose(body)
     if body.get("operation")=="commit": return await commit(body)
     return response({"error":"operation must be propose or commit"},400)
+
+app.include_router(incident_router)

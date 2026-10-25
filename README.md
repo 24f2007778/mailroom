@@ -58,3 +58,20 @@ in the caller's Network response. A `503` can indicate model configuration,
 provider, timeout, or output-validation problems. If a generated proposal does
 not match its action schema, the service asks the model for up to two corrected
 proposals; it returns `503` if the corrections still fail validation.
+
+## Incident Agent API
+
+The service also implements the `ga5-incident-agent/v2` workflow:
+
+- `POST /v2/incidents`
+- `POST /v2/incidents/{runId}/receipts`
+- `GET /v2/incidents/{runId}`
+
+Configure `LLM_API_KEY` and optionally `INCIDENT_LLM_MODEL` for incident
+planning. `INCIDENT_PLAN_TIMEOUT_SECONDS` sets the planner deadline and is
+capped below the portal's 18-second request limit. Incident state and receipt
+replays use the same SQLite database configured by `DATABASE_PATH`; use
+persistent storage in hosted deployments. Submit the HTTPS service URL with
+no credentials, query, or fragment as the public base URL for this API. The
+incident endpoint does not send the request's
+`sensitive` object to the model or include it in stored run state or telemetry.
